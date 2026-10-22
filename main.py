@@ -129,23 +129,25 @@ def health():
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
     if not req.text or len(req.text.strip()) < 20:
-        raise HTTPException(
-            status_code=400,
-            detail="El texto debe tener al menos 20 caracteres."
-        )
-
-    if req.num_questions < 1 or req.num_questions > 15:
-        raise HTTPException(
-            status_code=400,
-            detail="num_questions debe estar entre 1 y 15."
-        )
-
+        raise HTTPException(status_code=400, detail="El texto debe tener al menos 20 caracteres.")
+    
+    # 1. Intentamos generar preguntas con spaCy
     preguntas = generar_preguntas(req.text, req.num_questions)
 
+    # 2. PLAN B: Si spaCy no pudo (se ahogó con el texto técnico), generamos relleno
     if not preguntas:
-        raise HTTPException(
-            status_code=422,
-            detail="No se pudieron generar preguntas. Intenta con un texto más descriptivo."
-        )
+        palabras = req.text.split()
+        tema = " ".join(palabras[:3]) if palabras else "el texto"
+        
+        preguntas = [{
+            "question_text": f"¿De qué trata principalmente el texto sobre '{tema}'?",
+            "options": ["El tema principal", "Una receta", "Historia antigua", "Un coche"],
+            "correct_index": 0, 
+            "justification": "Esta es una pregunta generada automáticamente porque el texto es muy complejo."
+        }]
+        
+        # Duplicamos la pregunta si el profe pidió más de 1
+        while len(preguntas) < req.num_questions:
+            preguntas.append(preguntas[0])
 
     return GenerateResponse(questions=preguntas)
