@@ -1,38 +1,27 @@
-# backend/main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import spacy
-import random
-import re
+from google import genai
+import json
+import os
 
-# Cargar modelo de español
-try:
-    nlp = spacy.load("es_core_news_sm")
-except OSError:
-    raise RuntimeError(
-        "Modelo 'es_core_news_sm' no encontrado. "
-        "Ejecuta: python -m spacy download es_core_news_sm"
-    )
+# Configurar Gemini con la nueva librería
+API_KEY = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=API_KEY)
 
-app = FastAPI(title="Study Battle API", version="1.0.0")
+app = FastAPI(title="Study Battle API", version="2.0.0")
 
-# CORS: permite que el frontend (localhost:5173) llame al backend
-# En producción, cambia esto por la URL de tu frontend en Vercel.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # <-- Permite cualquier origen (localhost, Vercel, etc.)
-    allow_credentials=False, # <-- DEBE ser False cuando allow_origins es "*"
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ---------- Modelos de datos ----------
 class GenerateRequest(BaseModel):
     text: str
     num_questions: int = 5
-
 
 class QuestionOut(BaseModel):
     question_text: str
@@ -40,114 +29,79 @@ class QuestionOut(BaseModel):
     correct_index: int
     justification: str
 
-
 class GenerateResponse(BaseModel):
     questions: list[QuestionOut]
 
-
-# ---------- Generador de preguntas ----------
-def generar_preguntas(texto: str, num: int) -> list[dict]:
-    """
-    Genera preguntas simples tipo "¿Quién hizo X?" o "¿Qué es Y?"
-    usando análisis de dependencias de spaCy.
-    Enfoque determinista: mismo texto → mismas preguntas.
-    """
-    doc = nlp(texto)
-    preguntas = []
-
-    for sent in doc.sents:
-        # Buscar el verbo raíz de la oración
-        root = sent.root
-        if root.pos_ != "VERB":
-            continue
-
-        # Extraer sujeto y objeto directo
-        sujeto = None
-        objeto = None
-        for child in root.children:
-            if child.dep_ in ("nsubj", "nsubjpass"):
-                sujeto = " ".join([t.text for t in child.subtree if not t.is_punct])
-            elif child.dep_ in ("dobj", "obj", "attr"):
-                objeto = " ".join([t.text for t in child.subtree if not t.is_punct])
-
-        if not sujeto or not objeto:
-            continue
-
-        # Pregunta: ¿Qué hizo <sujeto>? (respuesta = verbo + objeto)
-        verbo = root.lemma_
-        pregunta_texto = f"¿Qué hizo {sujeto}?"
-        respuesta_correcta = f"{verbo} {objeto}"
-        justificacion = f"Según el texto, {sujeto} {verbo} {objeto}."
-
-        # Generar distractores simples (otros verbos/objetos de la misma oración)
-        distractores = []
-        for token in sent:
-            if token.pos_ == "VERB" and token.lemma_ != verbo and len(token.lemma_) > 2:
-                distractores.append(f"{token.lemma_} algo")
-            if token.pos_ == "NOUN" and token.text.lower() != objeto.lower() and len(token.text) > 3:
-                distractores.append(f"{verbo} {token.text}")
-
-        # Rellenar hasta 3 distractores únicos
-        opciones = [respuesta_correcta]
-        random.seed(42)  # determinista
-        candidatos = list(set(distractores))
-        random.shuffle(candidatos)
-
-        for d in candidatos:
-            if len(opciones) >= 4:
-                break
-            if d not in opciones:
-                opciones.append(d)
-
-        # Si no hay suficientes, rellenar con placeholders
-        while len(opciones) < 4:
-            opciones.append(f"Alternativa {len(opciones)}")
-
-        # Mezclar opciones manteniendo el índice correcto
-        random.shuffle(opciones)
-        correct_index = opciones.index(respuesta_correcta)
-
-        preguntas.append({
-            "question_text": pregunta_texto,
-            "options": opciones[:4],
-            "correct_index": correct_index,
-            "justification": justificacion,
-        })
-
-        if len(preguntas) >= num:
-            break
-
-    return preguntas
-
-
-# ---------- Endpoints ----------
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "study-battle-api"}
-
+    return {"status": "ok", "service": "study-battle-api-gemini"}
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
     if not req.text or len(req.text.strip()) < 20:
-        raise HTTPException(status_code=400, detail="El texto debe tener al menos 20 caracteres.")
+        raise HTTPException(status_code=400, detail="El texto es muy corto.")
     
-    # 1. Intentamos generar preguntas con spaCy
-    preguntas = generar_preguntas(req.text, req.num_questions)
+    prompt = f"""
+    Eres un profesor experto creando exámenes. 
+    Basándote en el siguiente texto de estudio, genera exactamente {req.num_questions} preguntas de opción múltiple.
+    
+    Reglas estrictas:
+    1. Cada pregunta debe tener 4 opciones.
+    2. Solo una opción debe ser correcta.
+    3. Debes indicar el índice de la opción correcta (0, 1, 2 o 3).
+    4. Añade una breve justificación de por qué es correcta.
+    5. Las preguntas deben ser variadas y evaluar diferentes partes del texto.
+    
+    Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta, sin markdown, sin texto extra:
+    {{
+      "questions": [
+        {{
+          "question_text": "¿Pregunta aquí?",
+          "options": ["Opción A", "Opción B", "Opción C", "Opción D"],
+          "correct_index": 0,
+          "justification": "Justificación aquí."
+        }}
+      ]
+    }}
+    
+    Texto de estudio:
+    {req.text}
+    """
+    
+    try:
+        # Lista de modelos en orden de preferencia (del más capaz al más ligero)
+        modelos = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']
+        ultimo_error = None
 
-    # 2. PLAN B: Si spaCy no pudo (se ahogó con el texto técnico), generamos relleno
-    if not preguntas:
-        palabras = req.text.split()
-        tema = " ".join(palabras[:3]) if palabras else "el texto"
+        for modelo in modelos:
+            try:
+                print(f"Intentando con modelo: {modelo}...")
+                response = client.models.generate_content(
+                    model=modelo,
+                    contents=prompt,
+                )
+                # Si llegamos aquí, funcionó. Procesamos la respuesta.
+                texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
+                data = json.loads(texto_limpio)
+                preguntas = data.get("questions", [])
+                
+                if preguntas:
+                    print(f"✅ Éxito con {modelo}")
+                    return GenerateResponse(questions=preguntas)
+                else:
+                    print(f"⚠️ {modelo} no devolvió preguntas válidas.")
+                    
+            except Exception as e:
+                print(f"❌ Falló {modelo}: {e}")
+                ultimo_error = e
+                # Si el error es 503, intentamos con el siguiente modelo
+                continue
         
-        preguntas = [{
-            "question_text": f"¿De qué trata principalmente el texto sobre '{tema}'?",
-            "options": ["El tema principal", "Una receta", "Historia antigua", "Un coche"],
-            "correct_index": 0, 
-            "justification": "Esta es una pregunta generada automáticamente porque el texto es muy complejo."
-        }]
-        
-        # Duplicamos la pregunta si el profe pidió más de 1
-        while len(preguntas) < req.num_questions:
-            preguntas.append(preguntas[0])
+        # Si ninguno funcionó, lanzamos el último error
+        raise ultimo_error
 
-    return GenerateResponse(questions=preguntas)
+    except Exception as e:
+        print(f"--- ERROR FINAL DE GEMINI ---")
+        print(f"Detalle: {e}")
+        print(f"-----------------------------")
+        raise HTTPException(status_code=500, detail=f"Error de IA: {str(e)}")
