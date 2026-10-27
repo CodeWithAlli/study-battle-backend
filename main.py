@@ -76,14 +76,10 @@ def generate(req: GenerateRequest):
     
     for img_b64 in req.images:
         try:
-            # Limpiamos el prefijo "data:image/jpeg;base64," o "data:application/pdf;base64,"
             header, encoded = img_b64.split(",", 1)
             mime_type = header.split(";")[0].split(":")[1]
-            
-            # Decodificamos los bytes
             image_bytes = base64.b64decode(encoded)
             
-            # Usamos types.Part que es la forma correcta en la nueva librería
             contents.append(
                 types.Part.from_bytes(
                     data=image_bytes,
@@ -94,19 +90,23 @@ def generate(req: GenerateRequest):
             print(f"Error decodificando archivo adjunto: {e}")
             continue
 
-    # 🔥 SISTEMA DE REINTENTOS PARA EVITAR ERRORES 503
-    max_intentos = 3
+    # 🔥 SISTEMA DE RESPALDO: Prueba con varios modelos si uno falla por saturación (503)
+    modelos = [
+        'gemini-3.5-flash-lite',   # El más ligero y rápido
+        'gemini-3.8-flash',        # El más potente
+        'gemini-2.5-flash'         # Respaldo antiguo
+    ]
+    
     ultimo_error = None
 
-    for intento in range(max_intentos):
+    for modelo in modelos:
         try:
-            # Usamos un modelo "Lite" que tiene menos demanda y suele estar disponible
+            print(f"Intentando generar con: {modelo}...")
             response = client.models.generate_content(
-                model='gemini-3.5-flash-lite', 
+                model=modelo,
                 contents=contents,
             )
             
-            # Limpiamos la respuesta de Gemini
             texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
             data = json.loads(texto_limpio)
             preguntas = data.get("questions", [])
@@ -114,14 +114,20 @@ def generate(req: GenerateRequest):
             if not preguntas:
                 raise ValueError("La IA no devolvió preguntas válidas")
                 
+            print(f"✅ Éxito con {modelo}")
             return GenerateResponse(questions=preguntas)
             
         except Exception as e:
+            print(f"❌ Falló {modelo}: {e}")
             ultimo_error = e
-            print(f"Intento {intento + 1} falló: {e}")
-            if intento < max_intentos - 1:
-                time.sleep(2) # Espera 2 segundos antes de reintentar
-            else:
-                print(f"--- ERROR FINAL DE GEMINI ---")
-                print(f"Detalle: {e}")
-                raise HTTPException(status_code=500, detail=f"Error de IA tras {max_intentos} intentos: {str(e)}")
+            # Esperamos 1 segundo antes de probar el siguiente modelo
+            time.sleep(1) 
+            continue 
+
+    # Si ningún modelo funcionó
+    print(f"--- ERROR FINAL: TODOS LOS MODELOS FALLARON ---")
+    print(f"Último detalle: {ultimo_error}")
+    raise HTTPException(
+        status_code=500, 
+        detail=f"Todos los modelos de IA están saturados en este momento. Intenta de nuevo en unos minutos. (Error: {str(ultimo_error)})"
+    )
