@@ -2,10 +2,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
+from google.genai import types
+from dotenv import load_dotenv
 import json
 import os
 import base64
 from typing import List, Optional
+
+load_dotenv()
 
 # Configurar Gemini con la nueva librería
 API_KEY = os.getenv("GEMINI_API_KEY")
@@ -46,7 +50,7 @@ def generate(req: GenerateRequest):
 
     prompt = f"""
     Eres un profesor experto creando exámenes. 
-    Basándote en el siguiente texto de estudio Y EN LAS IMÁGENES ADJUNTAS, genera exactamente {req.num_questions} preguntas de opción múltiple.
+    Basándote en el siguiente texto de estudio Y EN LAS IMÁGENES O DOCUMENTOS ADJUNTOS, genera exactamente {req.num_questions} preguntas de opción múltiple.
     
     Si hay imágenes de gráficos, diagramas o dispositivos, úsalas para hacer preguntas visuales.
     
@@ -70,23 +74,34 @@ def generate(req: GenerateRequest):
         # Preparamos el contenido para Gemini
         contents = [prompt]
         
-        # Añadimos las imágenes al contenido
+        # Añadimos las imágenes/PDFs al contenido
         for img_b64 in req.images:
-            # Limpiamos el prefijo "data:image/jpeg;base64," para obtener solo el base64
-            header, encoded = img_b64.split(",", 1)
-            mime_type = header.split(";")[0].split(":")[1]
-            
-            # Gemini espera partes de imagen con su mime type y bytes
-            contents.append({
-                "mime_type": mime_type,
-                "data": base64.b64decode(encoded)
-            })
+            try:
+                # Limpiamos el prefijo "data:image/jpeg;base64," o "data:application/pdf;base64,"
+                header, encoded = img_b64.split(",", 1)
+                mime_type = header.split(";")[0].split(":")[1]
+                
+                # Decodificamos los bytes
+                image_bytes = base64.b64decode(encoded)
+                
+                # Usamos types.Part que es la forma correcta en la nueva librería
+                contents.append(
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type=mime_type
+                    )
+                )
+            except Exception as e:
+                print(f"Error decodificando archivo adjunto: {e}")
+                continue
 
+        # Hacemos la llamada a Gemini
         response = client.models.generate_content(
-            model='gemini-3.8-flash', # Asegúrate de usar un modelo que soporte visión (los Flash lo hacen)
+            model='gemini-3.8-flash', # El modelo que ya te funcionó
             contents=contents,
         )
         
+        # Limpiamos la respuesta de Gemini
         texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
         data = json.loads(texto_limpio)
         preguntas = data.get("questions", [])
