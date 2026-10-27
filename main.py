@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import json
 import os
 import base64
+import time
 from typing import List, Optional
 
 load_dotenv()
@@ -70,48 +71,57 @@ def generate(req: GenerateRequest):
     {req.text}
     """
 
-    try:
-        # Preparamos el contenido para Gemini
-        contents = [prompt]
-        
-        # Añadimos las imágenes/PDFs al contenido
-        for img_b64 in req.images:
-            try:
-                # Limpiamos el prefijo "data:image/jpeg;base64," o "data:application/pdf;base64,"
-                header, encoded = img_b64.split(",", 1)
-                mime_type = header.split(";")[0].split(":")[1]
-                
-                # Decodificamos los bytes
-                image_bytes = base64.b64decode(encoded)
-                
-                # Usamos types.Part que es la forma correcta en la nueva librería
-                contents.append(
-                    types.Part.from_bytes(
-                        data=image_bytes,
-                        mime_type=mime_type
-                    )
-                )
-            except Exception as e:
-                print(f"Error decodificando archivo adjunto: {e}")
-                continue
-
-        # Hacemos la llamada a Gemini
-        response = client.models.generate_content(
-            model='gemini-3.8-flash', # El modelo que ya te funcionó
-            contents=contents,
-        )
-        
-        # Limpiamos la respuesta de Gemini
-        texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(texto_limpio)
-        preguntas = data.get("questions", [])
-        
-        if not preguntas:
-            raise ValueError("La IA no devolvió preguntas válidas")
+    # Preparamos el contenido para Gemini (texto + imágenes/PDFs)
+    contents = [prompt]
+    
+    for img_b64 in req.images:
+        try:
+            # Limpiamos el prefijo "data:image/jpeg;base64," o "data:application/pdf;base64,"
+            header, encoded = img_b64.split(",", 1)
+            mime_type = header.split(";")[0].split(":")[1]
             
-        return GenerateResponse(questions=preguntas)
-        
-    except Exception as e:
-        print(f"--- ERROR DE GEMINI ---")
-        print(f"Detalle: {e}")
-        raise HTTPException(status_code=500, detail=f"Error de IA: {str(e)}")
+            # Decodificamos los bytes
+            image_bytes = base64.b64decode(encoded)
+            
+            # Usamos types.Part que es la forma correcta en la nueva librería
+            contents.append(
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=mime_type
+                )
+            )
+        except Exception as e:
+            print(f"Error decodificando archivo adjunto: {e}")
+            continue
+
+    # 🔥 SISTEMA DE REINTENTOS PARA EVITAR ERRORES 503
+    max_intentos = 3
+    ultimo_error = None
+
+    for intento in range(max_intentos):
+        try:
+            # Usamos un modelo "Lite" que tiene menos demanda y suele estar disponible
+            response = client.models.generate_content(
+                model='gemini-3.5-flash-lite', 
+                contents=contents,
+            )
+            
+            # Limpiamos la respuesta de Gemini
+            texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(texto_limpio)
+            preguntas = data.get("questions", [])
+            
+            if not preguntas:
+                raise ValueError("La IA no devolvió preguntas válidas")
+                
+            return GenerateResponse(questions=preguntas)
+            
+        except Exception as e:
+            ultimo_error = e
+            print(f"Intento {intento + 1} falló: {e}")
+            if intento < max_intentos - 1:
+                time.sleep(2) # Espera 2 segundos antes de reintentar
+            else:
+                print(f"--- ERROR FINAL DE GEMINI ---")
+                print(f"Detalle: {e}")
+                raise HTTPException(status_code=500, detail=f"Error de IA tras {max_intentos} intentos: {str(e)}")
