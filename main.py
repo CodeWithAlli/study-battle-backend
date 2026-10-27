@@ -4,6 +4,8 @@ from pydantic import BaseModel
 from google import genai
 import json
 import os
+import base64
+from typing import List, Optional
 
 # Configurar Gemini con la nueva librería
 API_KEY = os.getenv("GEMINI_API_KEY")
@@ -22,6 +24,7 @@ app.add_middleware(
 class GenerateRequest(BaseModel):
     text: str
     num_questions: int = 5
+    images: List[str] = []
 
 class QuestionOut(BaseModel):
     question_text: str
@@ -38,19 +41,14 @@ def health():
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
-    if not req.text or len(req.text.strip()) < 20:
-        raise HTTPException(status_code=400, detail="El texto es muy corto.")
-    
+    if not req.text or (len(req.text.strip()) < 20 and not req.images):
+        raise HTTPException(status_code=400, detail="El texto es muy corto y no hay imágenes.")
+
     prompt = f"""
     Eres un profesor experto creando exámenes. 
-    Basándote en el siguiente texto de estudio, genera exactamente {req.num_questions} preguntas de opción múltiple.
+    Basándote en el siguiente texto de estudio Y EN LAS IMÁGENES ADJUNTAS, genera exactamente {req.num_questions} preguntas de opción múltiple.
     
-    Reglas estrictas:
-    1. Cada pregunta debe tener 4 opciones.
-    2. Solo una opción debe ser correcta.
-    3. Debes indicar el índice de la opción correcta (0, 1, 2 o 3).
-    4. Añade una breve justificación de por qué es correcta.
-    5. Las preguntas deben ser variadas y evaluar diferentes partes del texto.
+    Si hay imágenes de gráficos, diagramas o dispositivos, úsalas para hacer preguntas visuales.
     
     Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta, sin markdown, sin texto extra:
     {{
@@ -67,41 +65,38 @@ def generate(req: GenerateRequest):
     Texto de estudio:
     {req.text}
     """
-    
+
     try:
-        # Lista de modelos en orden de preferencia (del más capaz al más ligero)
-        modelos = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']
-        ultimo_error = None
-
-        for modelo in modelos:
-            try:
-                print(f"Intentando con modelo: {modelo}...")
-                response = client.models.generate_content(
-                    model=modelo,
-                    contents=prompt,
-                )
-                # Si llegamos aquí, funcionó. Procesamos la respuesta.
-                texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
-                data = json.loads(texto_limpio)
-                preguntas = data.get("questions", [])
-                
-                if preguntas:
-                    print(f"✅ Éxito con {modelo}")
-                    return GenerateResponse(questions=preguntas)
-                else:
-                    print(f"⚠️ {modelo} no devolvió preguntas válidas.")
-                    
-            except Exception as e:
-                print(f"❌ Falló {modelo}: {e}")
-                ultimo_error = e
-                # Si el error es 503, intentamos con el siguiente modelo
-                continue
+        # Preparamos el contenido para Gemini
+        contents = [prompt]
         
-        # Si ninguno funcionó, lanzamos el último error
-        raise ultimo_error
+        # Añadimos las imágenes al contenido
+        for img_b64 in req.images:
+            # Limpiamos el prefijo "data:image/jpeg;base64," para obtener solo el base64
+            header, encoded = img_b64.split(",", 1)
+            mime_type = header.split(";")[0].split(":")[1]
+            
+            # Gemini espera partes de imagen con su mime type y bytes
+            contents.append({
+                "mime_type": mime_type,
+                "data": base64.b64decode(encoded)
+            })
 
+        response = client.models.generate_content(
+            model='gemini-3.8-flash', # Asegúrate de usar un modelo que soporte visión (los Flash lo hacen)
+            contents=contents,
+        )
+        
+        texto_limpio = response.text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(texto_limpio)
+        preguntas = data.get("questions", [])
+        
+        if not preguntas:
+            raise ValueError("La IA no devolvió preguntas válidas")
+            
+        return GenerateResponse(questions=preguntas)
+        
     except Exception as e:
-        print(f"--- ERROR FINAL DE GEMINI ---")
+        print(f"--- ERROR DE GEMINI ---")
         print(f"Detalle: {e}")
-        print(f"-----------------------------")
         raise HTTPException(status_code=500, detail=f"Error de IA: {str(e)}")
